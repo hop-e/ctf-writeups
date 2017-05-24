@@ -185,7 +185,7 @@ def rop_nop():
 ----
 
 
-=== Information Collection
+=== Collecting Information
 
 We don't know exactly what libc version is
 used on the server. To find out I leaked the GOT and used https://github.com/niklasb/libc-database[this]
@@ -252,7 +252,7 @@ $ ./find atoi e80 read 670 setvbuf e70
 ubuntu-xenial-amd64-libc6 (id libc6_2.23-0ubuntu7_amd64)
 ....
 
-=== Exploitation
+=== Exploiting
 
 Next we have to get the offset between
 write and open. To do that we use the dump script from the libc database:
